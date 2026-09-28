@@ -6,7 +6,7 @@ package com.github.lisama569.resilientapigatewayjava.gateway.error;
 public class UpstreamResult {
 
     public enum FailureKind {
-        NONE, TIMEOUT, CONNECT_FAILURE, BUSINESS_ERROR
+        NONE, TIMEOUT, CONNECT_FAILURE, BUSINESS_ERROR, CLIENT_REJECTED
     }
 
     private final int status;
@@ -27,6 +27,11 @@ public class UpstreamResult {
 
     public static UpstreamResult businessError(int status, String body, long latencyMs) {
         return new UpstreamResult(status, body, latencyMs, FailureKind.BUSINESS_ERROR);
+    }
+
+    /** 上游因调用方自身原因拒绝请求（4xx）：不可重试、不故障转移、不计入熔断失败。 */
+    public static UpstreamResult clientRejected(int status, String body, long latencyMs) {
+        return new UpstreamResult(status, body, latencyMs, FailureKind.CLIENT_REJECTED);
     }
 
     public static UpstreamResult timeout(long latencyMs) {

@@ -2,12 +2,14 @@ package com.github.lisama569.resilientapigatewayjava.gateway;
 
 import com.github.lisama569.resilientapigatewayjava.gateway.error.GatewayErrorCode;
 import com.github.lisama569.resilientapigatewayjava.gateway.error.GatewayException;
+import com.github.lisama569.resilientapigatewayjava.idempotency.IdempotencyStore;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.LinkedHashMap;
@@ -16,6 +18,7 @@ import java.util.Map;
 /**
  * 网关 REST 入口：/gateway/{routeId}/** 转发到对应路由的上游组，
  * 归一化错误码映射为可区分的 HTTP 状态与错误体。
+ * GET /gateway/idempotency/{key} 为幂等键只读状态查询入口。
  */
 @RestController
 public class GatewayController {
@@ -41,9 +44,39 @@ public class GatewayController {
         }
     }
 
+    /**
+     * 只读查询幂等键处理状态，绝不触发上游调用：
+     * COMPLETED  -> 200 + 结果；
+     * PROCESSING -> 409 + IDEMPOTENT_PROCESSING（还在处理，暂无结果）；
+     * NOT_FOUND  -> 404 + IDEMPOTENT_KEY_NOT_FOUND（从未见过该键）。
+     */
+    @RequestMapping(value = "/gateway/idempotency/{key}", method = RequestMethod.GET)
+    public ResponseEntity<?> queryIdempotent(@PathVariable String key) {
+        IdempotencyStore.QueryResult result = gatewayService.queryIdempotent(key);
+        return switch (result.getStatus()) {
+            case COMPLETED -> {
+                Map<String, Object> body = new LinkedHashMap<>();
+                body.put("status", "COMPLETED");
+                body.put("key", key);
+                body.put("result", result.getBody());
+                yield ResponseEntity.ok(body);
+            }
+            case PROCESSING -> ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                    "code", GatewayErrorCode.IDEMPOTENT_PROCESSING.name(),
+                    "message", "idempotency key " + key + " is still being processed; no result yet",
+                    "key", key));
+            case NOT_FOUND -> ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
+                    "code", GatewayErrorCode.IDEMPOTENT_KEY_NOT_FOUND.name(),
+                    "message", "idempotency key " + key + " is unknown; no request has been seen",
+                    "key", key));
+        };
+    }
+
     private HttpStatus toHttpStatus(GatewayErrorCode code) {
         return switch (code) {
-            case ROUTE_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case ROUTE_NOT_FOUND, IDEMPOTENT_KEY_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case UPSTREAM_REJECTED -> HttpStatus.UNPROCESSABLE_ENTITY;
+            case IDEMPOTENT_PROCESSING -> HttpStatus.CONFLICT;
             case NO_HEALTHY_UPSTREAM, CIRCUIT_OPEN -> HttpStatus.SERVICE_UNAVAILABLE;
             case CONCURRENCY_LIMIT_EXCEEDED, RATE_LIMIT_EXCEEDED -> HttpStatus.TOO_MANY_REQUESTS;
             case UPSTREAM_TIMEOUT, RETRY_BUDGET_EXHAUSTED -> HttpStatus.GATEWAY_TIMEOUT;
@@ -58,6 +91,12 @@ public class GatewayController {
         body.put("message", e.getMessage());
         if (e.getUpstreamId() != null) {
             body.put("upstreamId", e.getUpstreamId());
+        }
+        if (e.getUpstreamStatus() != null) {
+            body.put("upstreamStatus", e.getUpstreamStatus());
+        }
+        if (e.getDetail() != null) {
+            body.put("detail", e.getDetail());
         }
         return body;
     }

@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 /**
  * 基于 JDK HttpServer 的模拟上游，可在本地启动。
@@ -26,6 +27,7 @@ public class MockUpstreamServer {
 
     private volatile long latencyMs = 0;
     private volatile FailureMode failureMode = FailureMode.NONE;
+    private volatile Supplier<FailureMode> failureModeSupplier;
     private volatile boolean running = false;
     private HttpServer server;
 
@@ -67,7 +69,18 @@ public class MockUpstreamServer {
     }
 
     public void setFailureMode(FailureMode mode) {
+        this.failureModeSupplier = null;
         this.failureMode = mode;
+    }
+
+    /** 设置动态失败模式：每次请求实时取模式（如“前 N 次失败后恢复”）。 */
+    public void setFailureMode(Supplier<FailureMode> supplier) {
+        this.failureModeSupplier = supplier;
+    }
+
+    private FailureMode currentFailureMode() {
+        Supplier<FailureMode> supplier = failureModeSupplier;
+        return supplier != null ? supplier.get() : failureMode;
     }
 
     /** 已发生的真实副作用次数（按幂等键去重后）。 */
@@ -83,7 +96,7 @@ public class MockUpstreamServer {
     private void handleWork(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
         totalRequestCount.incrementAndGet();
         try {
-            switch (failureMode) {
+            switch (currentFailureMode()) {
                 case RESET -> {
                     // 不发送任何响应头直接关闭，模拟连接被重置
                     exchange.close();
@@ -99,6 +112,12 @@ public class MockUpstreamServer {
                 }
                 case ALWAYS_500 -> {
                     respond(exchange, 500, "upstream business error from " + id);
+                    return;
+                }
+                case ALWAYS_400 -> {
+                    // 上游因调用方自身原因拒绝（参数不合法 / 业务规则不允许）
+                    respond(exchange, 400, "client request rejected by " + id
+                            + ": invalid argument or business rule violation");
                     return;
                 }
                 case NONE -> {
@@ -148,7 +167,8 @@ public class MockUpstreamServer {
 
     public enum FailureMode {
         NONE,           // 正常
-        ALWAYS_500,     // 上游业务错误
+        ALWAYS_500,     // 上游内部错误（5xx）
+        ALWAYS_400,     // 调用方原因被拒（4xx）
         HANG,           // 永不响应（触发超时）
         RESET           // 连接被重置（IO 失败）
     }

@@ -22,9 +22,12 @@ import java.util.UUID;
 
 /**
  * 网关核心编排：
- * 路由匹配 -> 幂等短路 -> 逐次尝试（并发限流 -> 速率限流 -> 熔断许可 -> 调用上游）
+ * 路由匹配 -> 幂等单飞占位（同键并发仅一个真实处理者）->
+ * 逐次尝试（并发限流 -> 速率限流 -> 熔断许可 -> 调用上游）
  * -> 可重试错误在整体超时预算内有限重试并故障转移到健康实例。
- * 同一业务请求共用同一幂等键，重复投递不会产生重复副作用。
+ *
+ * <p>同一业务请求共用同一幂等键：先到者真实处理，晚到者等待同一结果或收到
+ * 可区分的“处理中”快速失败；上游 4xx 拒绝不重试、不转移、不计入熔断。
  */
 public class GatewayService {
 
@@ -82,17 +85,93 @@ public class GatewayService {
                     "route " + routeId + " has no usable upstream");
         }
         String key = idempotencyKey == null ? UUID.randomUUID().toString() : idempotencyKey;
-        var cached = idempotencyStore.getIfPresent(key);
-        if (cached.isPresent()) {
-            diagnostics.record("idempotent-hit: key=" + key + " routeId=" + routeId);
-            return cached.get();
-        }
-        diagnostics.record("route decision: routeId=" + routeId + " path=" + path
-                + " candidates=" + candidateIds(candidates) + " key=" + key);
 
+        // 未显式携带幂等键的请求走独立执行路径：键唯一，不参与单飞合并，行为与旧版一致
+        if (idempotencyKey == null) {
+            return processAsOwner(routeId, path, key, candidates, null);
+        }
+
+        // 携带幂等键：原子占位，保证同键并发只有一个真实处理者
+        for (int round = 0; round < 2; round++) {
+            IdempotencyStore.AcquireOutcome outcome = idempotencyStore.acquire(key);
+            if (outcome.isCompletedHit()) {
+                diagnostics.record("idempotent-hit: key=" + key + " routeId=" + routeId);
+                return outcome.getBody();
+            }
+            if (outcome.isAcquired()) {
+                return processAsOwner(routeId, path, key, candidates, outcome.getEntry());
+            }
+            // 晚到者：等待在途处理结果
+            diagnostics.record("idempotent-wait: key=" + key + " routeId=" + routeId
+                    + " waitMs=" + properties.getIdempotentWaitMs());
+            IdempotencyStore.AwaitOutcome awaited;
+            try {
+                awaited = outcome.getEntry().await(properties.getIdempotentWaitMs());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new GatewayException(GatewayErrorCode.INTERNAL_ERROR, "interrupted while waiting");
+            }
+            switch (awaited.getKind()) {
+                case SUCCESS -> {
+                    diagnostics.record("idempotent-wait-result: key=" + key + " routeId=" + routeId);
+                    return awaited.getBody();
+                }
+                case TIMEOUT -> throw new GatewayException(GatewayErrorCode.IDEMPOTENT_PROCESSING,
+                        "request with idempotency key " + key + " is still being processed; "
+                                + "query the status endpoint or retry later");
+                case FAILED -> {
+                    // owner 失败已释放占位：第一轮允许本线程重新占位接管处理，避免晚到者盲目报错
+                    diagnostics.record("idempotent-owner-failed-reacquire: key=" + key
+                            + " routeId=" + routeId + " round=" + round);
+                    if (round == 0) {
+                        continue;
+                    }
+                    throw new GatewayException(GatewayErrorCode.IDEMPOTENT_PROCESSING,
+                            "request with idempotency key " + key + " has no settled result yet; "
+                                    + "query the status endpoint or retry later");
+                }
+            }
+        }
+        throw new GatewayException(GatewayErrorCode.IDEMPOTENT_PROCESSING,
+                "request with idempotency key " + key + " is still being processed");
+    }
+
+    /**
+     * 只读查询幂等键处理状态：绝不触发上游调用。
+     */
+    public IdempotencyStore.QueryResult queryIdempotent(String key) {
+        return idempotencyStore.query(key);
+    }
+
+    /**
+     * owner 执行路径：真实发起上游尝试。成功发布幂等结果；任何失败都释放占位，
+     * 使后续同键请求可以重新发起（失败本身向上抛出，由调用方决定是否再来）。
+     */
+    private String processAsOwner(String routeId, String path, String key,
+                                  List<UpstreamInstance> candidates,
+                                  IdempotencyStore.Entry entry) throws GatewayException {
+        diagnostics.record("route decision: routeId=" + routeId + " path=" + path
+                + " candidates=" + candidateIds(candidates) + " key=" + key
+                + (entry == null ? " (ephemeral key)" : " (idempotency owner)"));
+        try {
+            String body = executeAttempts(routeId, path, key, candidates);
+            idempotencyStore.complete(key, body);
+            return body;
+        } catch (GatewayException e) {
+            if (entry != null) {
+                idempotencyStore.fail(key, entry);
+            }
+            throw e;
+        }
+    }
+
+    private String executeAttempts(String routeId, String path, String key,
+                                  List<UpstreamInstance> candidates) throws GatewayException {
         long deadlineNanos = System.nanoTime() + properties.getOverallTimeoutMs() * 1_000_000L;
         UpstreamResult.FailureKind lastFailure = null;
         String lastUpstreamId = null;
+        Integer lastUpstreamStatus = null;
+        String lastDetail = null;
         int attemptsUsed = 0;
         int permitSkips = 0;
         // 负载均衡决定首个候选起点，之后按序轮转实现故障转移
@@ -162,16 +241,27 @@ public class GatewayService {
                 UpstreamResult result = client.call(upstream, path, key, attemptTimeout);
                 if (result.isSuccess()) {
                     breaker.onSuccess();
-                    idempotencyStore.store(key, result.getBody());
                     diagnostics.record("success: upstream=" + uid
                             + " attempts=" + attemptsUsed
                             + " latencyMs=" + result.getLatencyMs()
                             + " breaker=" + breaker.getState());
                     return result.getBody();
                 }
+                if (result.getFailureKind() == UpstreamResult.FailureKind.CLIENT_REJECTED) {
+                    // 调用方自身原因：不重试、不故障转移、不计入熔断失败，直接区分表达
+                    diagnostics.record("upstream client rejection: upstream=" + uid
+                            + " status=" + result.getStatus()
+                            + " attempt=" + attemptsUsed);
+                    throw new GatewayException(GatewayErrorCode.UPSTREAM_REJECTED,
+                            "upstream " + uid + " rejected the request as client error; "
+                                    + "fix the request instead of retrying",
+                            uid, result.getStatus(), result.getBody());
+                }
                 breaker.onFailure();
                 lastFailure = result.getFailureKind();
                 lastUpstreamId = uid;
+                lastUpstreamStatus = result.getStatus();
+                lastDetail = result.getBody();
                 diagnostics.record("upstream failure: kind=" + result.getFailureKind()
                         + " upstream=" + uid
                         + " attempt=" + attemptsUsed
@@ -182,11 +272,14 @@ public class GatewayService {
                 concurrencyLimiter.release();
             }
         }
-        throw mapLastFailure(lastFailure, lastUpstreamId, attemptsUsed);
+        throw mapLastFailure(lastFailure, lastUpstreamId, lastUpstreamStatus, lastDetail, attemptsUsed);
     }
 
     private GatewayException mapLastFailure(UpstreamResult.FailureKind lastFailure,
-                                            String lastUpstreamId, int attemptsUsed) {
+                                            String lastUpstreamId,
+                                            Integer lastUpstreamStatus,
+                                            String lastDetail,
+                                            int attemptsUsed) {
         diagnostics.record("retries exhausted: attempts=" + attemptsUsed
                 + " lastFailure=" + lastFailure + " upstream=" + lastUpstreamId);
         if (lastFailure == null) {
@@ -198,7 +291,8 @@ public class GatewayService {
             case CONNECT_FAILURE -> new GatewayException(GatewayErrorCode.UPSTREAM_CONNECT_FAILURE,
                     "upstream connect failure after " + attemptsUsed + " attempts", lastUpstreamId);
             case BUSINESS_ERROR -> new GatewayException(GatewayErrorCode.UPSTREAM_BUSINESS_ERROR,
-                    "upstream business error after " + attemptsUsed + " attempts", lastUpstreamId);
+                    "upstream internal error after " + attemptsUsed + " attempts",
+                    lastUpstreamId, lastUpstreamStatus, lastDetail);
             default -> new GatewayException(GatewayErrorCode.INTERNAL_ERROR, "unexpected");
         };
     }

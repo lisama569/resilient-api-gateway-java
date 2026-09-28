@@ -49,6 +49,10 @@ public class UpstreamClient {
             if (status >= 500) {
                 return UpstreamResult.businessError(status, response.body(), latency);
             }
+            if (status >= 400) {
+                // 调用方自身原因被上游拒绝：参数不合法/业务规则不允许等
+                return UpstreamResult.clientRejected(status, response.body(), latency);
+            }
             return UpstreamResult.success(status, response.body(), latency);
         } catch (HttpTimeoutException e) {
             // 含连接超时（HttpConnectTimeoutException 是其子类）
