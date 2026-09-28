@@ -11,6 +11,9 @@ import com.github.lisama569.resilientapigatewayjava.gateway.limit.ConcurrencyLim
 import com.github.lisama569.resilientapigatewayjava.gateway.limit.RateLimiter;
 import com.github.lisama569.resilientapigatewayjava.gateway.route.LoadBalancer;
 import com.github.lisama569.resilientapigatewayjava.gateway.route.RouteRule;
+import com.github.lisama569.resilientapigatewayjava.idempotency.IdempotencyLease;
+import com.github.lisama569.resilientapigatewayjava.idempotency.IdempotencyPrepareResult;
+import com.github.lisama569.resilientapigatewayjava.idempotency.IdempotencySnapshot;
 import com.github.lisama569.resilientapigatewayjava.idempotency.IdempotencyStore;
 import com.github.lisama569.resilientapigatewayjava.upstream.UpstreamInstance;
 
@@ -22,9 +25,9 @@ import java.util.UUID;
 
 /**
  * 网关核心编排：
- * 路由匹配 -> 幂等短路 -> 逐次尝试（并发限流 -> 速率限流 -> 熔断许可 -> 调用上游）
- * -> 可重试错误在整体超时预算内有限重试并故障转移到健康实例。
- * 同一业务请求共用同一幂等键，重复投递不会产生重复副作用。
+ * 路由匹配 -> 在途幂等协调（同键并发唯一 leader，晚到者等待复用或快速返回处理中）
+ * -> leader 逐次尝试（并发限流 -> 速率限流 -> 熔断许可 -> 调用上游）
+ * -> 可重试错误在整体超时预算内有限重试并故障转移到健康实例；4xx 拒绝直接终态返回。
  */
 public class GatewayService {
 
@@ -90,6 +93,42 @@ public class GatewayService {
         diagnostics.record("route decision: routeId=" + routeId + " path=" + path
                 + " candidates=" + candidateIds(candidates) + " key=" + key);
 
+        // 在途去重：同键并发只有一个 leader 真正打上游；follower 等待复用结果，
+        // 等待超时则快速返回与限流/熔断/上游故障都不同的“处理中”状态
+        IdempotencyPrepareResult prepared =
+                idempotencyStore.prepare(key, properties.getIdempotencyWaitMs());
+        if (prepared.isCompleted()) {
+            diagnostics.record("idempotent-hit: key=" + key + " routeId=" + routeId
+                    + " via=inflight");
+            return prepared.getBody();
+        }
+        if (prepared.isStillInFlight()) {
+            diagnostics.record("idempotency in-flight fast-return: key=" + key
+                    + " routeId=" + routeId);
+            throw new GatewayException(GatewayErrorCode.IDEMPOTENCY_IN_PROGRESS,
+                    "request with idempotency key '" + key + "' is still being processed",
+                    null, 0, key);
+        }
+        IdempotencyLease lease = prepared.getLease();
+        try {
+            String body = executeWithFailover(routeId, path, key, candidates);
+            idempotencyStore.complete(lease, body);
+            return body;
+        } catch (GatewayException e) {
+            // leader 未成功（含 4xx 拒绝终态与各类可重试失败）：释放在途条目，
+            // 唤醒的等待者可竞争成为新 leader；4xx 是否重试由 executeWithFailover 保证（不重试）
+            idempotencyStore.fail(lease);
+            throw e;
+        }
+    }
+
+    /**
+     * leader 执行：并发限流 -> 速率限流 -> 熔断许可 -> 调用上游，
+     * 可重试错误（超时 / 连接失败 / 5xx）在整体超时预算内有限重试并故障转移；
+     * 4xx 拒绝立即终态返回。
+     */
+    private String executeWithFailover(String routeId, String path, String key,
+                                       List<UpstreamInstance> candidates) throws GatewayException {
         long deadlineNanos = System.nanoTime() + properties.getOverallTimeoutMs() * 1_000_000L;
         UpstreamResult.FailureKind lastFailure = null;
         String lastUpstreamId = null;
@@ -162,12 +201,20 @@ public class GatewayService {
                 UpstreamResult result = client.call(upstream, path, key, attemptTimeout);
                 if (result.isSuccess()) {
                     breaker.onSuccess();
-                    idempotencyStore.store(key, result.getBody());
                     diagnostics.record("success: upstream=" + uid
                             + " attempts=" + attemptsUsed
                             + " latencyMs=" + result.getLatencyMs()
                             + " breaker=" + breaker.getState());
                     return result.getBody();
+                }
+                if (result.getFailureKind() == UpstreamResult.FailureKind.REJECTED) {
+                    // 调用方原因（4xx）：不算熔断失败、不重试、不故障转移，直接终态返回
+                    breaker.onRejected();
+                    diagnostics.record("upstream rejected: status=" + result.getStatus()
+                            + " upstream=" + uid + " attempt=" + attemptsUsed);
+                    throw new GatewayException(GatewayErrorCode.UPSTREAM_REJECTED,
+                            "upstream " + uid + " rejected the request as client error",
+                            uid, result.getStatus(), result.getBody());
                 }
                 breaker.onFailure();
                 lastFailure = result.getFailureKind();
@@ -231,8 +278,15 @@ public class GatewayService {
         return candidates.stream().map(UpstreamInstance::id).toList();
     }
 
-    public CircuitBreaker getCircuitBreaker(String upstreamId) {
-        return circuitBreakers.get(upstreamId);
+    /**
+     * 只读查询幂等键状态：无记录返回 null（控制器映射 404），
+     * 处理中返回 IN_FLIGHT 快照，已完成返回 COMPLETED 与结果体。
+     */
+    public IdempotencySnapshot queryStatus(String key) {
+        return idempotencyStore.statusOf(key).orElse(null);
+    }
+
+    public CircuitBreaker getCircuitBreaker(String upstreamId) {        return circuitBreakers.get(upstreamId);
     }
 
     public ConcurrencyLimiter getConcurrencyLimiter(String upstreamId) {

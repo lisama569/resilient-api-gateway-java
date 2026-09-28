@@ -71,6 +71,17 @@ public class CircuitBreaker {
         }
     }
 
+    /**
+     * 上游在受理前因调用方原因拒绝（4xx）：与上游健康度无关。
+     * 不累计失败、不触发熔断；仅在半开时归还探测许可（不改变熔断状态，
+     * 是否闭合仍由真正的上游探测结果决定）。
+     */
+    public synchronized void onRejected() {
+        if (state == CircuitState.HALF_OPEN) {
+            halfOpenInFlight = Math.max(0, halfOpenInFlight - 1);
+        }
+    }
+
     public synchronized CircuitState getState() {
         maybeTransitionToHalfOpen();
         return state;

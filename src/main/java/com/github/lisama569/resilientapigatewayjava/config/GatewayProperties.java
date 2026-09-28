@@ -22,6 +22,8 @@ public class GatewayProperties {
     private int circuitFailureThreshold = 3;
     private long circuitOpenDurationMs = 2000;
     private int circuitHalfOpenPermits = 1;
+    /** 晚到的同键请求等待先到请求结果的最长时间；超时后快速返回“处理中”。 */
+    private long idempotencyWaitMs = 1000;
 
     public List<UpstreamInstance> getUpstreams() {
         return upstreams;
@@ -85,5 +87,13 @@ public class GatewayProperties {
 
     public void setCircuitHalfOpenPermits(int circuitHalfOpenPermits) {
         this.circuitHalfOpenPermits = circuitHalfOpenPermits;
+    }
+
+    public long getIdempotencyWaitMs() {
+        return idempotencyWaitMs;
+    }
+
+    public void setIdempotencyWaitMs(long idempotencyWaitMs) {
+        this.idempotencyWaitMs = idempotencyWaitMs;
     }
 }

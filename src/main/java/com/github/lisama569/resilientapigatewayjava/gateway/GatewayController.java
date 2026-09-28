@@ -43,9 +43,11 @@ public class GatewayController {
 
     private HttpStatus toHttpStatus(GatewayErrorCode code) {
         return switch (code) {
-            case ROUTE_NOT_FOUND -> HttpStatus.NOT_FOUND;
+            case ROUTE_NOT_FOUND, IDEMPOTENCY_KEY_NOT_FOUND -> HttpStatus.NOT_FOUND;
             case NO_HEALTHY_UPSTREAM, CIRCUIT_OPEN -> HttpStatus.SERVICE_UNAVAILABLE;
             case CONCURRENCY_LIMIT_EXCEEDED, RATE_LIMIT_EXCEEDED -> HttpStatus.TOO_MANY_REQUESTS;
+            case IDEMPOTENCY_IN_PROGRESS -> HttpStatus.CONFLICT;
+            case UPSTREAM_REJECTED -> HttpStatus.UNPROCESSABLE_ENTITY;
             case UPSTREAM_TIMEOUT, RETRY_BUDGET_EXHAUSTED -> HttpStatus.GATEWAY_TIMEOUT;
             case UPSTREAM_CONNECT_FAILURE, UPSTREAM_BUSINESS_ERROR -> HttpStatus.BAD_GATEWAY;
             default -> HttpStatus.INTERNAL_SERVER_ERROR;
@@ -58,6 +60,12 @@ public class GatewayController {
         body.put("message", e.getMessage());
         if (e.getUpstreamId() != null) {
             body.put("upstreamId", e.getUpstreamId());
+        }
+        if (e.getUpstreamStatus() > 0) {
+            body.put("upstreamStatus", e.getUpstreamStatus());
+        }
+        if (e.getDetail() != null) {
+            body.put("detail", e.getDetail());
         }
         return body;
     }

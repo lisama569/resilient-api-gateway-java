@@ -22,6 +22,8 @@ public class MockUpstreamServer {
     private final int requestedPort;
     private final AtomicInteger sideEffectCount = new AtomicInteger();
     private final AtomicInteger totalRequestCount = new AtomicInteger();
+    /** 已进入实际处理（通过故障模式分支、延迟开始之前）的请求数，供测试同步“请求已到达上游”。 */
+    private final AtomicInteger startedProcessingCount = new AtomicInteger();
     private final Map<String, String> idempotencyTable = new ConcurrentHashMap<>();
 
     private volatile long latencyMs = 0;
@@ -80,6 +82,11 @@ public class MockUpstreamServer {
         return totalRequestCount.get();
     }
 
+    /** 已开始实际处理（延迟开始之前）的请求数。 */
+    public int getStartedProcessingCount() {
+        return startedProcessingCount.get();
+    }
+
     private void handleWork(com.sun.net.httpserver.HttpExchange exchange) throws IOException {
         totalRequestCount.incrementAndGet();
         try {
@@ -98,28 +105,32 @@ public class MockUpstreamServer {
                     return;
                 }
                 case ALWAYS_500 -> {
-                    respond(exchange, 500, "upstream business error from " + id);
+                    respond(exchange, 500, "upstream internal error from " + id);
+                    return;
+                }
+                case REJECT_400 -> {
+                    // 调用方原因：受理前直接拒绝，不产生副作用
+                    respond(exchange, 400, "upstream rejected request from " + id + ": invalid request");
                     return;
                 }
                 case NONE -> {
                     // fall through
                 }
             }
+            startedProcessingCount.incrementAndGet();
             sleepQuietly(latencyMs);
             String idempotencyKey = exchange.getRequestHeaders().getFirst("Idempotency-Key");
-            if (idempotencyKey != null) {
-                String existing = idempotencyTable.get(idempotencyKey);
-                if (existing != null) {
-                    // 重复投递：返回首个结果，不产生新副作用
-                    respond(exchange, 200, existing);
-                    return;
-                }
+            if (idempotencyKey == null) {
+                int seq = sideEffectCount.incrementAndGet();
+                respond(exchange, 200, "upstream=" + id + " sideEffect=" + seq);
+                return;
             }
-            int seq = sideEffectCount.incrementAndGet();
-            String body = "upstream=" + id + " sideEffect=" + seq;
-            if (idempotencyKey != null) {
-                idempotencyTable.putIfAbsent(idempotencyKey, body);
-            }
+            // computeIfAbsent 原子完成“查表 / 产生副作用 / 登记”：
+            // 即使同键请求并发直打同一上游，真实副作用也只发生一次
+            String body = idempotencyTable.computeIfAbsent(idempotencyKey, k -> {
+                int seq = sideEffectCount.incrementAndGet();
+                return "upstream=" + id + " sideEffect=" + seq;
+            });
             respond(exchange, 200, body);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -148,7 +159,8 @@ public class MockUpstreamServer {
 
     public enum FailureMode {
         NONE,           // 正常
-        ALWAYS_500,     // 上游业务错误
+        ALWAYS_500,     // 上游内部故障
+        REJECT_400,     // 调用方原因：受理前拒绝（不产生副作用）
         HANG,           // 永不响应（触发超时）
         RESET           // 连接被重置（IO 失败）
     }

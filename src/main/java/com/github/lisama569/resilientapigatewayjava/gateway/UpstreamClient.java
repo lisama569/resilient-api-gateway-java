@@ -14,7 +14,8 @@ import java.time.Duration;
 
 /**
  * 上游 HTTP 调用客户端：单次尝试带独立超时，
- * 将超时、连接失败与上游业务错误归一化为可区分的 UpstreamResult。
+ * 将调用方原因被拒（4xx）、上游内部故障（5xx）、超时、连接失败
+ * 归一化为相互可区分的 UpstreamResult。
  */
 public class UpstreamClient {
 
@@ -47,7 +48,12 @@ public class UpstreamClient {
             long latency = elapsedMs(start);
             int status = response.statusCode();
             if (status >= 500) {
+                // 上游自身内部故障：可重试 / 可故障转移，计入熔断失败
                 return UpstreamResult.businessError(status, response.body(), latency);
+            }
+            if (status >= 400) {
+                // 上游在受理前因调用方原因拒绝：不重试、不故障转移、不计入熔断失败
+                return UpstreamResult.rejected(status, response.body(), latency);
             }
             return UpstreamResult.success(status, response.body(), latency);
         } catch (HttpTimeoutException e) {
