@@ -85,7 +85,9 @@ curl -X POST http://127.0.0.1:8080/gateway/unknown/work
 
 - 4xx 归一化为 **422 `UPSTREAM_REJECTED`**，错误体带 `upstreamId`、`upstreamStatus`、`detail`：
   含义是“改请求，而不是等上游恢复”；
-- **不重试、不故障转移到别的实例、不计入会把上游打到熔断的失败统计**；
+- **不重试、不故障转移到别的实例、不计入会把上游打到熔断的失败统计**；这条口径在
+  `CLOSED` / `OPEN` / `HALF_OPEN` 各阶段一致——恢复试探期间收到 4xx 只归还探测许可、
+  保持半开，不会重新熔断，也不会让上游永久卡在不可用状态；
 - 5xx 维持原语义：`UPSTREAM_BUSINESS_ERROR`（502），可重试、可故障转移、计入熔断。
 - 正常业务结果不受影响。
 
@@ -101,7 +103,12 @@ curl -X POST http://127.0.0.1:8080/gateway/unknown/work
   - `CLOSED`：正常放行；连续失败（超时 / 连接失败 / 5xx）达到 `circuit-failure-threshold` 后熔断。
   - `OPEN`：快速拒绝 `circuit-open-duration-ms`；期间请求不会打到上游。
   - `HALF_OPEN`：冷却结束后进入，仅放行 `circuit-half-open-permits` 个探测请求；
-    探测成功则闭合，探测失败则重新熔断并重新计时。
+    探测成功则闭合，探测失败（上游内部故障）则重新熔断并重新计时。
+  - **恢复试探期间收到调用方拒绝（4xx）不会把上游卡死**：4xx 既不是内部故障、也不代表上游恢复，
+    熔断器保持 `HALF_OPEN` 并**归还该探测许可**（不计失败、不重新熔断、不重新计时），
+    后续请求可以继续试探；待上游真正恢复，下一笔正常请求即探测成功、闭合熔断。
+    因此“故障 → 熔断 → 冷却 → 试探恰好是调用方的坏请求被 4xx 拒 → 上游恢复”这条链路
+    不再需要重启网关即可自愈，连续多轮、并发试探下也不会残留状态或泄漏许可。
   - 所有状态迁移在 `synchronized` 内完成，半开许可计数保证并发下不误放行、不状态错乱
     （有并发测试覆盖）。
 
@@ -171,8 +178,16 @@ mvn test
   首个上游 500 触发故障转移、请求分散到不同上游时仍只处理一次；完成后晚到投递直接拿缓存、
   不再触达上游；处理中超时返回可区分的 `IDEMPOTENT_PROCESSING`；owner 失败后同键可重新成功；
   并发风暴叠加多轮重试 + 故障转移保证不破。
-- `UpstreamRejectionTest`（**新增**）：4xx 表达为 `UPSTREAM_REJECTED`（422，带上游状态与详情）、
+- `UpstreamRejectionTest`：4xx 表达为 `UPSTREAM_REJECTED`（422，带上游状态与详情）、
   与 5xx 的 `UPSTREAM_BUSINESS_ERROR` 分离；4xx 不重试、不故障转移、不计入熔断；5xx 维持旧语义。
+- `HalfOpenRejectionRecoveryTest`（**新增**）：恢复试探期间收到调用方拒绝（4xx）后，
+  上游恢复的正常请求能真正透传成功并闭合熔断（无需重启）；连续 4 轮
+  “故障 → 熔断 → 冷却 → 试探被 4xx 拒 → 上游恢复”无残留状态；恢复试探并发下
+  在途许可占满时多余请求仍快速拒绝、在途 4xx 探测释放许可后可继续试探并恢复；
+  并发混合（一笔 4xx + 一笔成功）干净闭合。
+- `CircuitBreakerClientRejectionTest`（**新增**）：熔断器状态机单测——CLOSED 下 4xx
+  永不计失败；HALF_OPEN 下 4xx 归还许可并保持半开、成功探测可闭合；多轮 4xx 探测不阻塞
+  最终恢复；半开期间真正的内部故障仍重新熔断。
 - `IdempotencyQueryTest`（**新增**）：未知键 NOT_FOUND、处理中 PROCESSING（不报成功/失败、
   查询不触发上游）、已完成返回同一结果、失败不谎报完成且可重试。
 - `GatewayControllerWebTest`（**新增**）：查询入口路径优先级与 JSON、新错误码 HTTP 映射、
@@ -209,3 +224,31 @@ mvn test
    `ALWAYS_400` 立即返回 422 `UPSTREAM_REJECTED` 且不重试，`ALWAYS_500` 走重试 / 故障转移 /
    熔断，返回 502 `UPSTREAM_BUSINESS_ERROR` 或 503 `CIRCUIT_OPEN`）。相关断言见
    `UpstreamRejectionTest`，可在 IDE 中单独运行观察 `[gateway-diag]` 事件差异。
+
+4. **恢复试探被调用方拒绝后，上游恢复可自愈（本次修复场景）**：这是此前会导致上游
+   “再也放不进流量、只能重启网关”的缺陷。自动化复现与验证见
+   `HalfOpenRejectionRecoveryTest`（端到端，真实模拟上游 + HTTP 调用）与
+   `CircuitBreakerClientRejectionTest`（状态机单测）。手动时序如下：
+
+   ```java
+   // 1) 上游内部故障 -> 熔断器打开（阈值=1 时一次即熔断）
+   upstream.setFailureMode(FailureMode.ALWAYS_500);
+   service.handle("orders", "/work", null);          // UPSTREAM_BUSINESS_ERROR，breaker=OPEN
+
+   // 2) 等待冷却（circuit-open-duration-ms），熔断器进入 HALF_OPEN
+
+   // 3) 恢复试探恰好收到调用方原因的拒绝（4xx）
+   upstream.setFailureMode(FailureMode.ALWAYS_400);
+   service.handle("orders", "/work", null);          // UPSTREAM_REJECTED
+   //    修复前：半开探测许可泄漏，熔断器永久卡在 HALF_OPEN，之后所有请求都被快速拒绝
+   //    修复后：归还探测许可、保持 HALF_OPEN，不重新熔断、不重新计时
+
+   // 4) 上游真正恢复：下一笔正常请求探测成功、闭合熔断，无需重启
+   upstream.setFailureMode(FailureMode.NONE);
+   service.handle("orders", "/work", null);          // 200，真正到达上游，breaker=CLOSED
+   ```
+
+   修复前在第 4 步会得到 `CIRCUIT_OPEN`（“no circuit permits available”），且请求不再到达上游；
+   修复后第 4 步正常透传。可用 `mvn test -Dtest=HalfOpenRejectionRecoveryTest`
+   单独验证，观察 `[gateway-diag]` 中 `attempt ... breaker=HALF_OPEN` →
+   `upstream client rejection`（许可归还）→ `success ... breaker=CLOSED` 的事件序列。
