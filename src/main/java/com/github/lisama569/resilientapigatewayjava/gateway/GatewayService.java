@@ -248,10 +248,13 @@ public class GatewayService {
                     return result.getBody();
                 }
                 if (result.getFailureKind() == UpstreamResult.FailureKind.CLIENT_REJECTED) {
-                    // 调用方自身原因：不重试、不故障转移、不计入熔断失败，直接区分表达
+                    // 调用方自身原因：不重试、不故障转移、不计入熔断失败，直接区分表达；
+                    // 必须释放半开探测许可，否则许可泄漏会把上游永久卡在 HALF_OPEN
+                    breaker.onRejected();
                     diagnostics.record("upstream client rejection: upstream=" + uid
                             + " status=" + result.getStatus()
-                            + " attempt=" + attemptsUsed);
+                            + " attempt=" + attemptsUsed
+                            + " breaker=" + breaker.getState());
                     throw new GatewayException(GatewayErrorCode.UPSTREAM_REJECTED,
                             "upstream " + uid + " rejected the request as client error; "
                                     + "fix the request instead of retrying",

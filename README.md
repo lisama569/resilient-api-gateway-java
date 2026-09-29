@@ -86,6 +86,11 @@ curl -X POST http://127.0.0.1:8080/gateway/unknown/work
 - 4xx 归一化为 **422 `UPSTREAM_REJECTED`**，错误体带 `upstreamId`、`upstreamStatus`、`detail`：
   含义是“改请求，而不是等上游恢复”；
 - **不重试、不故障转移到别的实例、不计入会把上游打到熔断的失败统计**；
+- 这条口径在熔断器的各个阶段一致：正常（CLOSED）、熔断（OPEN，根本到不了上游）、
+  恢复试探（HALF_OPEN）都一样。试探请求若收到 4xx，只释放本次探测许可——
+  既不闭合熔断器、也不重新熔断、不计失败；上游恢复后新的探测/正常请求仍能打进去，
+  不会出现“试探被拒一次后上游永久放不进流量、只能重启网关”的情况
+  （回归测试见 `HalfOpenClientRejectionTest`）。
 - 5xx 维持原语义：`UPSTREAM_BUSINESS_ERROR`（502），可重试、可故障转移、计入熔断。
 - 正常业务结果不受影响。
 
@@ -101,7 +106,9 @@ curl -X POST http://127.0.0.1:8080/gateway/unknown/work
   - `CLOSED`：正常放行；连续失败（超时 / 连接失败 / 5xx）达到 `circuit-failure-threshold` 后熔断。
   - `OPEN`：快速拒绝 `circuit-open-duration-ms`；期间请求不会打到上游。
   - `HALF_OPEN`：冷却结束后进入，仅放行 `circuit-half-open-permits` 个探测请求；
-    探测成功则闭合，探测失败则重新熔断并重新计时。
+    探测成功则闭合，探测失败（超时 / 连接失败 / 5xx）则重新熔断并重新计时；
+    探测遇到调用方拒绝（4xx）时**只释放探测许可**，状态保持 HALF_OPEN、不计失败，
+    后续探测可继续放行，许可不会泄漏。
   - 所有状态迁移在 `synchronized` 内完成，半开许可计数保证并发下不误放行、不状态错乱
     （有并发测试覆盖）。
 
@@ -173,6 +180,10 @@ mvn test
   并发风暴叠加多轮重试 + 故障转移保证不破。
 - `UpstreamRejectionTest`（**新增**）：4xx 表达为 `UPSTREAM_REJECTED`（422，带上游状态与详情）、
   与 5xx 的 `UPSTREAM_BUSINESS_ERROR` 分离；4xx 不重试、不故障转移、不计入熔断；5xx 维持旧语义。
+- `HalfOpenClientRejectionTest`（**新增，本次修复的回归测试**）：恢复试探（HALF_OPEN）恰好
+  收到 4xx 时探测许可必须释放——上游恢复后正常请求能重新打入、熔断器正常闭合；
+  连续多轮“故障 → 熔断 → 冷却 → 试探被拒 → 恢复”不留残留状态（失败计数清零、副作用不丢不重）；
+  恢复试探期间 8 路并发请求下 4xx 仍只按 `UPSTREAM_REJECTED` 表达、不计熔断、不状态错乱。
 - `IdempotencyQueryTest`（**新增**）：未知键 NOT_FOUND、处理中 PROCESSING（不报成功/失败、
   查询不触发上游）、已完成返回同一结果、失败不谎报完成且可重试。
 - `GatewayControllerWebTest`（**新增**）：查询入口路径优先级与 JSON、新错误码 HTTP 映射、
@@ -209,3 +220,21 @@ mvn test
    `ALWAYS_400` 立即返回 422 `UPSTREAM_REJECTED` 且不重试，`ALWAYS_500` 走重试 / 故障转移 /
    熔断，返回 502 `UPSTREAM_BUSINESS_ERROR` 或 503 `CIRCUIT_OPEN`）。相关断言见
    `UpstreamRejectionTest`，可在 IDE 中单独运行观察 `[gateway-diag]` 事件差异。
+
+4. **恢复试探被 4xx 拒绝后上游不再卡死（本次修复场景）**：修复前，上游熔断冷却结束进入
+   恢复试探时若这次探测收到 4xx，半开探测许可会被永久泄漏——之后哪怕上游已完全恢复，
+   所有请求仍被快速拒绝为 503 `CIRCUIT_OPEN`（与限流/熔断同样的快速失败外观），只能重启网关。
+   复现与验证直接跑回归测试即可（用例内部用 `MockUpstreamServer` 精确控制
+   “500 熔断 → 冷却 → 探测回 400 → 恢复 200”的时序）：
+
+   ```bash
+   # 单跑本场景回归（含多轮循环与并发试探）
+   mvn test -Dtest=HalfOpenClientRejectionTest
+
+   # 全量回归：路由 / 限流 / 重试 / 熔断 / 幂等既有用例不回归
+   mvn test
+   ```
+
+   修复后的行为：试探期 4xx 仍返回 422 `UPSTREAM_REJECTED`（不重试、不转移、不计熔断），
+   探测许可被释放，熔断器停留在 HALF_OPEN；上游恢复后下一个请求作为新探测打入上游，
+   成功后熔断器闭合，流量完全恢复。

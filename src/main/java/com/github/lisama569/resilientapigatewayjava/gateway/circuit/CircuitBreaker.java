@@ -4,7 +4,8 @@ package com.github.lisama569.resilientapigatewayjava.gateway.circuit;
  * 按上游维度的熔断器。
  * CLOSED：正常放行，连续失败达到阈值后熔断；
  * OPEN：快速拒绝，冷却期结束后进入 HALF_OPEN；
- * HALF_OPEN：仅放行有限个探测请求，探测成功则闭合，失败则重新熔断。
+ * HALF_OPEN：仅放行有限个探测请求，探测成功则闭合，失败则重新熔断；
+ * 探测遇到调用方拒绝（4xx）时只释放探测许可，既不闭合也不重新熔断、不计失败。
  * 所有状态迁移在 synchronized 内完成，并发下不会误放行或状态错乱。
  */
 public class CircuitBreaker {
@@ -56,6 +57,17 @@ public class CircuitBreaker {
         } else if (state == CircuitState.CLOSED) {
             consecutiveFailures = 0;
         }
+    }
+
+    /**
+     * 调用方原因被拒（4xx）：不算上游故障，也不闭合熔断器，
+     * 但必须释放半开探测许可，否则许可泄漏会让上游永久卡在 HALF_OPEN 放不进流量。
+     */
+    public synchronized void onRejected() {
+        if (state == CircuitState.HALF_OPEN) {
+            halfOpenInFlight = Math.max(0, halfOpenInFlight - 1);
+        }
+        // CLOSED 下无需动作：拒绝本就不计入连续失败
     }
 
     public synchronized void onFailure() {
